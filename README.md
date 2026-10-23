@@ -1,6 +1,6 @@
 # discuz-php
 
-给 **Discuz! X3.5** 用的 PHP-FPM 镜像。基于官方 `php:<version>-fpm-alpine`，预装 Discuz 必需的扩展，并把 `www-data` 对齐到 uid/gid 1000。
+给 **Discuz! X3.5** 用的 PHP-FPM 镜像。基于官方 `php:<version>-fpm-alpine`，预装 Discuz 必需的扩展。
 
 ## 为什么需要这个
 
