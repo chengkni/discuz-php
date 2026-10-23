@@ -35,11 +35,12 @@ services:
 
 | 标签 | 说明 |
 |---|---|
-| `php-8.5.12` | 指定 PHP 版本（推荐） |
-| `php-8.4.27` | |
-| `php-7.4.33` | 已 EOL，仅供旧环境对照 |
+| `php-8.5.12` | 精确版本（推荐，可复现） |
+| `php-8.5` | 跟随该分支最新补丁，上游发新版自动更新 |
+| `php-8.4.27` / `php-8.4` | |
+| `php-7.4.33` / `php-7.4` | 已 EOL，仅供旧环境对照 |
 | `fp-<hash>` | 构建指纹标签，CI 用它判断是否需要重编 |
-| `latest` | 跟随 `PHP_VERSIONS` 里的最新版本 |
+| `latest` | 跟随 `LATEST_BRANCH`（默认 8.5） |
 | `sha-<commit>` | 对应 commit |
 
 ## 镜像内容
@@ -83,12 +84,26 @@ docker build -t discuz-php:8.5 --build-arg PHP_VERSION=8.5.12 .
 
 推送到 `main` 或手动触发即自动构建。
 
-**要加新版本**，只改 `PHP_VERSIONS` 一处：
+**要加新分支**，只改 `PHP_BRANCHES` 一处：
 
 ```yaml
 env:
-  PHP_VERSIONS: "7.4.33 8.4.27 8.5.12"
+  PHP_BRANCHES: "7.4 8.4 8.5"     # 写分支，不写精确版本号
+  LATEST_BRANCH: "8.5"            # 这个分支的最新版额外打上 :latest
 ```
+
+### 版本自动跟踪
+
+`check` job 会查 Docker Hub API，解析每个分支当前的**最新补丁版本**：
+
+```
+PHP_BRANCHES: "7.4 8.4 8.5"
+        ↓ 解析
+7.4.33-fpm-alpine  8.4.27-fpm-alpine  8.5.12-fpm-alpine
+```
+
+**上游一发新版（8.5.13），解析结果就变 → digest 变 → 指纹变 → 自动重编。**
+你不需要改任何代码。
 
 ### 构建指纹机制
 
