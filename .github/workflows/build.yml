@@ -345,3 +345,40 @@ jobs:
               dist/discuz-php_${ver}_linux_arm64.tar.gz \
               dist/discuz-php_${ver}_linux_arm64.tar.gz.sha256
           done
+
+  # ============================================================ 保活
+  # GitHub 会在仓库「60 天无活动」后自动停用定时工作流。
+  # 本 job 每 ~50 天写一次 .keepalive，让仓库保持活跃，cron 不会断。
+  #
+  # 提交信息带 [skip ci]，所以不会反过来触发构建。
+  # 只在 schedule 触发时运行 —— 手动触发/push 说明仓库本来就活跃。
+  keepalive:
+    name: 保活
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 距上次保活超过 50 天就写一次
+        run: |
+          set -eux
+          last=$(git log -1 --format=%ct -- .keepalive 2>/dev/null || echo 0)
+          days=$(( ($(date +%s) - last) / 86400 ))
+          echo "距上次保活提交：${days} 天"
+
+          if [ "$days" -lt 50 ]; then
+            echo "::notice::还没到 50 天，跳过"
+            exit 0
+          fi
+
+          date -u +'%Y-%m-%dT%H:%M:%SZ' > .keepalive
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .keepalive
+          git commit -m 'chore: 保活提交，防止定时工作流被 GitHub 停用 [skip ci]'
+          git push
+          echo "::notice::已提交保活，仓库活跃状态已刷新"

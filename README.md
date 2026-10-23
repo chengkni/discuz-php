@@ -129,6 +129,23 @@ PHP_BRANCHES: "7.4 8.4 8.5"
 **上游一发新版（8.5.13），解析结果就变 → digest 变 → 指纹变 → 自动重编。**
 你不需要改任何代码。
 
+### ⚠️ 定时工作流会被 GitHub 停用 —— 已加保活
+
+GitHub 会在仓库**连续 60 天无活动**后自动停用 `schedule` 触发。**对安全补丁来说这是致命的**——你会悄悄失去自动更新。
+
+本仓库的 `keepalive` job 会在每次定时运行时检查 `.keepalive` 的时间戳，**超过 50 天就写一次**，让仓库保持活跃：
+
+```
+定时运行 → 距上次保活 ≥50 天? → 是 → 提交 .keepalive（带 [skip ci]）
+                                    → 否 → 跳过
+```
+
+- 提交带 `[skip ci]`，**不会反过来触发构建**
+- 约每 50 天一次，一年 7 次左右
+- `.keepalive` 在 `.dockerignore` 里，**不影响镜像构建**
+
+> 手动触发（Actions → Run workflow）随时可用，不受停用影响。
+
 ### 构建指纹机制
 
 `check` job 会为每个版本算一个指纹：
@@ -152,6 +169,7 @@ PHP_BRANCHES: "7.4 8.4 8.5"
 ├── .github/workflows/build.yml    # CI：解析版本 → 指纹判断 → 多架构构建 → 推 GHCR → 挂 Release
 ├── Dockerfile                     # ARG PHP_VERSION，矩阵构建
 ├── docker-compose.example.yml     # 用法示例
+├── .keepalive                     # 保活时间戳（CI 自动维护）
 ├── .dockerignore
 ├── .gitignore
 └── README.md
