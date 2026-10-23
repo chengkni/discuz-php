@@ -230,3 +230,118 @@ jobs:
           # 上游一发新版指纹就变、缓存失效，所以这里可以放心开缓存。
           cache-from: type=gha,scope=php-${{ matrix.php }}
           cache-to: type=gha,mode=max,scope=php-${{ matrix.php }}
+
+      # ── 导出镜像归档（供 Release 下载，绕过慢速 docker pull）──
+      # 多架构 manifest list 没法直接 docker save，所以按架构单独构建一份。
+      # 复用上面的 buildx 缓存，第二次构建几乎不花时间。
+      - name: 导出各架构镜像归档
+        env:
+          REPO_LC: ${{ github.repository }}
+        run: |
+          set -eux
+          repo_lc=$(printf '%s' "$REPO_LC" | tr '[:upper:]' '[:lower:]')
+          image="${REGISTRY}/${repo_lc%%/*}/${IMAGE_NAME}"
+          ver="${{ matrix.php }}"
+
+          for arch in amd64 arm64; do
+            out="discuz-php_${ver}_linux_${arch}.tar"
+            docker buildx build \
+              --platform "linux/${arch}" \
+              --build-arg "PHP_VERSION=${ver}" \
+              --build-arg "FINGERPRINT=${{ matrix.fingerprint }}" \
+              --build-arg "REPO_URL=${{ github.server_url }}/${{ github.repository }}" \
+              --tag "${image}:php-${ver}" \
+              --output "type=docker,dest=${out}" \
+              --cache-from "type=gha,scope=php-${ver}" \
+              .
+            gzip -9 "$out"
+            sha256sum "${out}.gz" > "${out}.gz.sha256"
+          done
+
+          ls -lh discuz-php_*.tar.gz*
+
+      - name: 上传归档
+        uses: actions/upload-artifact@v4
+        with:
+          name: archives-${{ matrix.php }}
+          path: discuz-php_*.tar.gz*
+          retention-days: 7
+          if-no-files-found: error
+
+  # ============================================================ Release
+  # 把各版本的镜像归档挂到 GitHub Release。
+  # 用途：docker pull 慢的时候，直接下载 tar.gz → docker load，绕过 registry。
+  release:
+    name: 创建 Release
+    needs: [check, image]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 下载所有归档
+        uses: actions/download-artifact@v4
+        with:
+          pattern: archives-*
+          merge-multiple: true
+          path: dist
+
+      - name: 创建/更新 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MATRIX: ${{ needs.check.outputs.matrix }}
+          IMAGE: ${{ env.REGISTRY }}/${{ github.repository }}/${{ env.IMAGE_NAME }}
+        run: |
+          set -eux
+          ls -lh dist/
+
+          image_lc=$(printf '%s' "$IMAGE" | tr '[:upper:]' '[:lower:]')
+
+          for ver in $(printf '%s' "$MATRIX" | jq -r '.[].php'); do
+            tag="php-${ver}"
+
+            # 用 echo 逐行拼，避免 heredoc 里反引号被当成命令替换
+            {
+              echo "PHP ${ver} 的 PHP-FPM 镜像（Discuz! X3.5 用，已预装 gd / mysqli / pdo_mysql / zip / bcmath）。"
+              echo
+              echo "## 用法一：拉取镜像（推荐）"
+              echo
+              echo '```'
+              echo "docker pull ${image_lc}:php-${ver}"
+              echo '```'
+              echo
+              echo "## 用法二：下载归档（docker pull 慢时用）"
+              echo
+              echo "下载 \`discuz-php_${ver}_linux_amd64.tar.gz\` 和同名的 \`.sha256\`，然后："
+              echo
+              echo '```'
+              echo "sha256sum -c discuz-php_${ver}_linux_amd64.tar.gz.sha256"
+              echo "gunzip -c discuz-php_${ver}_linux_amd64.tar.gz | docker load"
+              echo '```'
+              echo
+              echo "加载出来的镜像名与 GHCR 上完全一致（\`${image_lc}:php-${ver}\`），compose 里的 \`image:\` 不用改。"
+              echo
+              echo "arm64 把文件名里的 \`amd64\` 换掉即可。"
+              echo
+              echo "## 构建信息"
+              echo
+              echo "- 构建日志：https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+              echo "- 本次提交：\`${GITHUB_SHA:0:7}\`"
+            } > notes.md
+
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release edit "$tag" --repo "$GITHUB_REPOSITORY" \
+                --title "PHP ${ver}" --notes-file notes.md
+            else
+              gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+                --target "$GITHUB_SHA" --title "PHP ${ver}" --notes-file notes.md
+            fi
+
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber \
+              dist/discuz-php_${ver}_linux_amd64.tar.gz \
+              dist/discuz-php_${ver}_linux_amd64.tar.gz.sha256 \
+              dist/discuz-php_${ver}_linux_arm64.tar.gz \
+              dist/discuz-php_${ver}_linux_arm64.tar.gz.sha256
+          done

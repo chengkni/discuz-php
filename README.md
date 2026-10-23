@@ -31,6 +31,30 @@ services:
       - ./site:/var/www/html
 ```
 
+## 用法二：下载归档（docker pull 慢时用）
+
+每个版本在 [Releases](../../releases) 里挂了镜像 tar 包，可以直接下载后 `docker load`，**绕过 registry**：
+
+```bash
+# 1. 下载（以 8.5.12 / amd64 为例）
+curl -fLO https://github.com/chengkni/discuz-php/releases/download/php-8.5.12/discuz-php_8.5.12_linux_amd64.tar.gz
+curl -fLO https://github.com/chengkni/discuz-php/releases/download/php-8.5.12/discuz-php_8.5.12_linux_amd64.tar.gz.sha256
+
+# 2. 校验
+sha256sum -c discuz-php_8.5.12_linux_amd64.tar.gz.sha256
+
+# 3. 加载
+gunzip -c discuz-php_8.5.12_linux_amd64.tar.gz | docker load
+```
+
+加载出来的镜像名**和 GHCR 上完全一致**（`ghcr.io/chengkni/discuz-php:php-8.5.12`），
+所以 compose 里的 `image:` 一个字都不用改。
+
+arm64 把文件名里的 `amd64` 换成 `arm64` 即可。
+
+> 归档是**按架构单独构建**的（多架构 manifest list 没法直接 `docker save`）。
+> 构建复用 GHCR 那份的 buildx 缓存，所以不会明显拖慢 CI。
+
 ## 可用标签
 
 | 标签 | 说明 |
@@ -125,7 +149,7 @@ PHP_BRANCHES: "7.4 8.4 8.5"
 
 ```
 .
-├── .github/workflows/build.yml    # CI：探测版本 → 指纹判断 → 多架构构建 → 推 GHCR
+├── .github/workflows/build.yml    # CI：解析版本 → 指纹判断 → 多架构构建 → 推 GHCR → 挂 Release
 ├── Dockerfile                     # ARG PHP_VERSION，矩阵构建
 ├── docker-compose.example.yml     # 用法示例
 ├── .dockerignore
