@@ -1,0 +1,160 @@
+# discuz-php
+
+给 **Discuz! X3.5** 用的 PHP-FPM 镜像。基于官方 `php:<version>-fpm-alpine`，预装 Discuz 必需的扩展，并把 `www-data` 对齐到 uid/gid 1000。
+
+## 为什么需要这个
+
+官方 `php:8.x-fpm-alpine` 镜像里**没有** Discuz 需要的这几个扩展：
+
+```
+gd  mysqli  pdo_mysql  zip  bcmath
+```
+
+而 Alpine 上从源码编译它们需要先装 gcc/binutils 整套工具链（200MB+），在慢网络环境下要十几分钟。
+
+**这个仓库把编译结果固化成镜像，一次构建、到处拉取。**
+
+> 工作流里的镜像名是**动态推导**的（取自 `github.repository`），代码里不写死账号名。
+
+## 用法
+
+```bash
+docker pull ghcr.io/chengkni/discuz-php:php-8.5.12
+```
+
+```yaml
+services:
+  php:
+    image: ghcr.io/chengkni/discuz-php:php-8.5.12
+    restart: unless-stopped
+    volumes:
+      - ./site:/var/www/html
+```
+
+## 可用标签
+
+| 标签 | 说明 |
+|---|---|
+| `php-8.5.12` | 指定 PHP 版本（推荐） |
+| `php-8.4.27` | |
+| `php-7.4.33` | 已 EOL，仅供旧环境对照 |
+| `fp-<hash>` | 构建指纹标签，CI 用它判断是否需要重编 |
+| `latest` | 跟随 `PHP_VERSIONS` 里的最新版本 |
+| `sha-<commit>` | 对应 commit |
+
+## 镜像内容
+
+| 项 | 值 |
+|---|---|
+| 基础镜像 | `php:<version>-fpm-alpine` |
+| PHP 扩展 | `gd` `mysqli` `pdo_mysql` `zip` `bcmath` |
+| gd 支持 | freetype + jpeg + png + **webp** |
+| `www-data` | **保持官方原样（82:82）**，镜像不做任何 uid 改写 |
+| `expose_php` | `Off`（不暴露 `X-Powered-By`） |
+| 错误日志 | 输出到 stderr（`docker logs` 可见） |
+
+### 关于文件权限
+
+镜像**不修改** `www-data` 的 uid/gid，保持和官方镜像一致。
+
+- **生产**：站点文件如果属于 `www-data`（82），天然一致，什么都不用做
+- **本地/其他 uid**：用 compose 的 `user:` 指定，不要改镜像
+
+```yaml
+services:
+  php:
+    image: ghcr.io/chengkni/discuz-php:php-8.5.12
+    user: "1000:1000"
+    # FPM 以非 root 启动时会忽略 pool 里的 user 指令，
+    # 工作进程直接以该 uid 运行（日志会提示 'user' directive is ignored）
+```
+
+**为什么不在镜像里改 uid**：那会让镜像和官方镜像产生意外差异。别人挂载属于 82 的文件时反而会坏掉。
+
+## 构建
+
+### 本地
+
+```bash
+docker build -t discuz-php:8.5 --build-arg PHP_VERSION=8.5.12 .
+```
+
+### CI
+
+推送到 `main` 或手动触发即自动构建。
+
+**要加新版本**，只改 `PHP_VERSIONS` 一处：
+
+```yaml
+env:
+  PHP_VERSIONS: "7.4.33 8.4.27 8.5.12"
+```
+
+### 构建指纹机制
+
+`check` job 会为每个版本算一个指纹：
+
+```
+指纹 = sha256( PHP版本 + 上游镜像digest + Dockerfile哈希 )
+```
+
+- **上游发新版**（如 `php:8.5-fpm-alpine` 更新到 8.5.13）→ digest 变 → 指纹变 → 自动重编
+- **Dockerfile 改动** → 哈希变 → 指纹变 → 自动重编
+- 指纹没变则跳过编译
+
+**定时探测（每 6 小时）和 PR 会走指纹闸门；push 和手动触发总是构建。**
+
+> 这个机制正好能帮你盯住 PHP 的安全补丁——上游一放新版本，CI 就会自动产出新镜像。
+
+## 目录结构
+
+```
+.
+├── .github/workflows/build.yml    # CI：探测版本 → 指纹判断 → 多架构构建 → 推 GHCR
+├── Dockerfile                     # ARG PHP_VERSION，矩阵构建
+├── docker-compose.example.yml     # 用法示例
+├── .dockerignore
+├── .gitignore
+└── README.md
+```
+
+## ⚠️ 踩过的坑
+
+### 1. 运行时库必须永久安装
+
+```dockerfile
+# ❌ 错误：只装 -dev 再 apk del，会把运行时库一起删掉
+RUN apk add --no-cache --virtual .build-deps freetype-dev libpng-dev ...; \
+    docker-php-ext-install gd; \
+    apk del --no-network .build-deps
+# → gd.so 加载失败：libpng16.so.16: No such file or directory
+
+# ✅ 正确：运行时库单独永久安装
+RUN apk add --no-cache freetype libjpeg-turbo libpng libwebp libzip; \
+    apk add --no-cache --virtual .build-deps freetype-dev libjpeg-turbo-dev ...; \
+    docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp; \
+    docker-php-ext-install gd mysqli pdo_mysql zip bcmath; \
+    apk del --no-network .build-deps
+```
+
+`-dev` 包会**拉入**运行时库，删掉 `-dev` 时运行时库也一起没了。必须显式永久安装。
+
+### 2. 不要改镜像里的 `www-data` uid
+
+曾经想在镜像里把 `www-data` 改成 uid 1000（对齐宿主机用户），**这是错的方向**：
+
+- 官方 alpine 镜像里是 `82:82`，**生产环境站点文件通常就是 82**，天然一致
+- 改掉之后，别人挂载属于 82 的文件反而会坏
+- 需要别的 uid 时，用 compose 的 `user:` 即可，一行搞定
+
+**镜像应该保持和官方一致，把差异留给使用方声明。**
+
+### 3. 本地构建慢 ≠ 有问题
+
+Alpine 上编译这些扩展需要先装 gcc/binutils 工具链。**网络慢的话（实测 246 KB/s）光下载就要 15 分钟以上。**
+
+这是选择用 CI 构建的主要原因——GitHub Actions 的机器网络是千兆的。
+
+## 相关
+
+- [PHP: Supported Versions](https://www.php.net/supported-versions.php) — PHP 维护时间表

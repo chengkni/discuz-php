@@ -1,0 +1,42 @@
+# discuz-php 用法示例
+#
+# 启动：docker compose -f docker-compose.example.yml up -d
+# 访问：http://localhost:8080
+
+services:
+  php:
+    image: ghcr.io/chengkni/discuz-php:php-8.5.12
+    restart: unless-stopped
+    volumes:
+      # 站点代码。首次用只读挂载确认没问题后再改成可写。
+      - ./site:/var/www/html
+    networks:
+      - dz
+
+  web:
+    image: nginx:stable-alpine
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - ./site:/var/www/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - dz
+    depends_on:
+      - php
+
+networks:
+  dz:
+    name: discuz-php-demo
+
+# ─────────────────────────────────────────────────────────────
+# 文件权限
+#
+# 镜像保持官方 www-data(82:82) 不变。如果站点文件属于别的 uid，
+# 给 php 服务加一行即可：
+#
+#     user: "1000:1000"
+#
+# FPM 以非 root 启动时会忽略 pool 里的 user 指令，工作进程直接以该 uid 运行。
+# ─────────────────────────────────────────────────────────────

@@ -1,0 +1,9 @@
+# 构建产物
+*.tar
+*.tar.gz
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store

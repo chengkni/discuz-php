@@ -1,0 +1,200 @@
+name: Build discuz-php
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  schedule:
+    # 每 6 小时轮询上游；只有「构建指纹」变了才真编译（见 check job）
+    - cron: "37 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      php_versions:
+        description: "要构建的 PHP 版本，空格分隔；留空 = 用下面的 PHP_VERSIONS"
+        required: false
+        default: ""
+      force:
+        description: "强制重建（忽略指纹缓存）"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 要构建的 PHP 版本清单：日常只需要改这一处。
+  # 加一个版本就在这里加一项，矩阵会自动展开。
+  PHP_VERSIONS: "7.4.33 8.4.27 8.5.12"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: discuz-php
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ============================================================ 版本探测
+  # 轻量 job：解析每个版本的「构建指纹」，决定哪些需要真编译
+  check:
+    name: 探测上游版本
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      summary: ${{ steps.resolve.outputs.summary }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: 解析版本与构建指纹
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          MANUAL: ${{ github.event.inputs.php_versions }}
+          FORCE: ${{ github.event.inputs.force }}
+          REPO_LC: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          repo_lc=$(printf '%s' "$REPO_LC" | tr '[:upper:]' '[:lower:]')
+          image="${REGISTRY}/${repo_lc%%/*}/${IMAGE_NAME}"
+
+          versions="${MANUAL:-$PHP_VERSIONS}"
+
+          # Dockerfile 本身也是构建输入，改了就要重编
+          df_hash=$(sha256sum Dockerfile | cut -c1-12)
+
+          # 指纹闸门只留给「定时探测」和 PR —— 那里才是烧额度的地方。
+          # push / 手动触发总是构建（见 caddy 仓库同样的取舍）。
+          gate=false
+          if [ "$EVENT" = "schedule" ] || [ "$EVENT" = "pull_request" ]; then
+            gate=true
+          fi
+          if [ "$FORCE" = "true" ]; then gate=false; fi
+
+          login_ok=false
+          if printf '%s' "$GH_TOKEN" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin >/dev/null 2>&1; then
+            login_ok=true
+          fi
+
+          matrix='[]'
+          summary=""
+
+          for v in $versions; do
+            base="php:${v}-fpm-alpine"
+
+            # 上游镜像 digest：上游一发新版，digest 变，指纹就变
+            digest=$(docker buildx imagetools inspect "$base" --format '{{.Manifest.Digest}}' 2>/dev/null || true)
+            if [ -z "$digest" ]; then
+              echo "::warning::无法解析 ${base} 的 digest，跳过 ${v}"
+              summary="${summary}| ${v} | 解析上游失败，跳过 | - |\n"
+              continue
+            fi
+
+            fp=$(printf 'php=%s;digest=%s;dockerfile=%s' "$v" "$digest" "$df_hash" | sha256sum | cut -c1-12)
+            fp_short=$(printf '%s' "$fp" | cut -c1-12)
+
+            need=true
+            reason="指纹 fp-${fp_short} 还没构建过"
+            if [ "$gate" = "true" ] && [ "$login_ok" = "true" ]; then
+              if docker buildx imagetools inspect "${image}:fp-${fp_short}" >/dev/null 2>&1; then
+                need=false
+                reason="指纹已存在，跳过"
+              fi
+            elif [ "$gate" = "false" ]; then
+              reason="手动/push 触发，总是构建"
+            else
+              reason="登录 GHCR 失败，保守起见构建"
+            fi
+
+            summary="${summary}| ${v} | ${reason} | \`fp-${fp_short}\` |\n"
+
+            if [ "$need" = "true" ]; then
+              matrix=$(printf '%s' "$matrix" | jq -c \
+                --arg v "$v" --arg fp "$fp_short" \
+                '. + [{"php": $v, "fingerprint": $fp}]')
+            fi
+          done
+
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 构建输入"
+            echo ""
+            echo "- Dockerfile 哈希：\`${df_hash}\`"
+            echo "- 目标版本：\`${versions}\`"
+            echo ""
+            echo "| PHP | 决定 | 指纹 |"
+            echo "|---|---|---|"
+            printf '%b' "$summary"
+            echo ""
+            echo "待构建：\`$(printf '%s' "$matrix" | jq -c '[.[].php]')\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::notice::待构建版本：$(printf '%s' "$matrix" | jq -c '[.[].php]')"
+
+  # ============================================================ 镜像
+  image:
+    name: 镜像 php-${{ matrix.php }}
+    needs: check
+    if: needs.check.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.check.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: 登录 GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 计算镜像名
+        id: img
+        env:
+          REPO_LC: ${{ github.repository }}
+        run: |
+          repo_lc=$(printf '%s' "$REPO_LC" | tr '[:upper:]' '[:lower:]')
+          echo "name=${REGISTRY}/${repo_lc%%/*}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: 生成标签
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.img.outputs.name }}
+          tags: |
+            type=raw,value=php-${{ matrix.php }}
+            type=raw,value=fp-${{ matrix.fingerprint }}
+            type=raw,value=latest,enable=${{ matrix.php == '8.5.12' && github.ref == 'refs/heads/main' }}
+            type=sha,format=short,prefix=sha-
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            PHP_VERSION=${{ matrix.php }}
+            FINGERPRINT=${{ matrix.fingerprint }}
+            REPO_URL=${{ github.server_url }}/${{ github.repository }}
+          # 缓存键天然跟着版本走：PHP_VERSION 和 FINGERPRINT 都出现在构建里，
+          # 上游一发新版指纹就变、缓存失效，所以这里可以放心开缓存。
+          cache-from: type=gha,scope=php-${{ matrix.php }}
+          cache-to: type=gha,mode=max,scope=php-${{ matrix.php }}
